@@ -16,7 +16,7 @@ image = (
         "git clone https://github.com/ASLP-lab/DiffRhythm.git /tmp/DiffRhythm",
         "cd /tmp/DiffRhythm && pip install -r requirements.txt",
     ])
-    .pip_install("supabase", "requests", "diffusers", "einops")
+    .pip_install("supabase", "requests", "diffusers==0.32.2", "einops")
     .env({
         "HF_HOME": "/.cache/huggingface",
         # Both the repo root and infer/ must be on the path so that
@@ -113,7 +113,10 @@ class MusicGenServer:
     def load_model(self):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        from diffusers import AutoPipelineForText2Image
+        # Import the specific pipeline class — avoids the AutoPipeline registry
+        # which eagerly imports every pipeline module (including Flux2 which
+        # requires Qwen3ForCausalLM, unavailable in transformers==4.49.0).
+        from diffusers import StableDiffusionXLPipeline
 
         # All DiffRhythm code uses relative paths — anchor to the repo root.
         os.chdir("/tmp/DiffRhythm")
@@ -144,7 +147,7 @@ class MusicGenServer:
         )
 
         # SDXL-Turbo — cover thumbnail generation
-        self.image_pipe = AutoPipelineForText2Image.from_pretrained(
+        self.image_pipe = StableDiffusionXLPipeline.from_pretrained(
             "stabilityai/sdxl-turbo",
             torch_dtype=torch.float16,
             variant="fp16",
@@ -331,7 +334,25 @@ class MusicGenServer:
         )
 
     # ------------------------------------------------------------------
-    # Endpoints  (same surface as before)
+    # Internal Modal method — callable with .remote() from local_entrypoint
+    # or any other Modal function. The HTTP webhooks below delegate here too.
+    # ------------------------------------------------------------------
+
+    @modal.method()
+    def run(self, request: GenerateWithDescribedLyricsRequest) -> GenerateMusicResponse:
+        """Run generation remotely. Used by local_entrypoint for smoke-tests."""
+        lyrics = "" if request.instrumental else self.generate_lyrics(
+            request.described_lyrics
+        )
+        return self._generate_and_upload(
+            style_prompt=request.prompt,
+            lyrics=lyrics,
+            description_for_categorization=request.prompt,
+            **request.model_dump(exclude={"prompt", "described_lyrics"}),
+        )
+
+    # ------------------------------------------------------------------
+    # HTTP Endpoints  (external callers — frontend, API clients)
     # ------------------------------------------------------------------
 
     @modal.fastapi_endpoint(method="POST", requires_proxy_auth=True)
@@ -386,9 +407,9 @@ class MusicGenServer:
 
 @app.local_entrypoint()
 def main():
-    # Call the Modal method directly (.remote()) instead of going through the
-    # HTTP endpoint — the HTTP endpoints require proxy auth (requires_proxy_auth=True)
-    # and are intended for external callers (e.g. the frontend).
+    # `@modal.fastapi_endpoint` functions are webhooks — they cannot be called
+    # with .remote(). Use the dedicated @modal.method `run` instead, which
+    # executes on the GPU container and returns the result directly.
     server = MusicGenServer()
 
     request_data = GenerateWithDescribedLyricsRequest(
@@ -399,7 +420,7 @@ def main():
         audio_duration=95.0,
     )
 
-    result = server.generate_with_described_lyrics.remote(request_data)
+    result = server.run.remote(request_data)
 
     print(f"Audio  : {result.audio_url}")
     print(f"Cover  : {result.cover_image_url}")
