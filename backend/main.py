@@ -31,46 +31,35 @@ music_gen_secrets = modal.Secret.from_name("music-generation-secret")
 
 
 # ---------------------------------------------------------------------------
-# LRC (timestamped lyrics) helpers
+# LRC helpers
 # ---------------------------------------------------------------------------
 
 def plain_lyrics_to_lrc(lyrics: str, total_duration_s: float = 95.0) -> str:
-    """
-    Convert plain lyrics (with section labels like [verse], [chorus]) into
-    a basic LRC format that DiffRhythm expects, e.g.:
-        [00:05.00]Line one
-        [00:08.50]Line two
-    We spread the lines evenly across the song duration, leaving a small
-    intro gap at the start.
-    """
     lines = [l.strip() for l in lyrics.strip().splitlines() if l.strip()]
     if not lines:
         return ""
-
-    intro_gap = 5.0  # seconds before first lyric
+    intro_gap = 5.0
     usable = total_duration_s - intro_gap
     gap = usable / max(len(lines), 1)
-
     lrc_lines = []
     for i, line in enumerate(lines):
         t = intro_gap + i * gap
         minutes = int(t // 60)
         seconds = t % 60
         lrc_lines.append(f"[{minutes:02d}:{seconds:05.2f}]{line}")
-
     return "\n".join(lrc_lines)
 
 
 # ---------------------------------------------------------------------------
-# Request / Response models  (mirrors your original ACE-Step interface)
+# Request / Response models
 # ---------------------------------------------------------------------------
 
 class AudioGenerationBase(BaseModel):
-    audio_duration: float = 95.0          # DiffRhythm-base max is 95s, full model 285s
+    audio_duration: float = 95.0
     seed: int = 42
-    steps: int = 32                        # diffusion steps (32 is a good default)
-    cfg_strength: float = 3.8             # classifier-free guidance scale
-    chunked: bool = True                   # use chunked VAE decode (saves VRAM)
+    steps: int = 32
+    cfg_strength: float = 3.8
+    chunked: bool = True
     instrumental: bool = False
 
 
@@ -79,8 +68,8 @@ class GenerateFromDescriptionRequest(AudioGenerationBase):
 
 
 class GenerateWithCustomLyricsRequest(AudioGenerationBase):
-    prompt: str          # style/genre description used as text prompt for DiffRhythm
-    lyrics: str          # plain lyrics (we convert to LRC internally)
+    prompt: str
+    lyrics: str
 
 
 class GenerateWithDescribedLyricsRequest(AudioGenerationBase):
@@ -89,8 +78,8 @@ class GenerateWithDescribedLyricsRequest(AudioGenerationBase):
 
 
 class GenerateMusicResponse(BaseModel):
-    audio_url: str           # Supabase Storage public URL
-    cover_image_url: str     # Supabase Storage public URL
+    audio_url: str
+    cover_image_url: str
     categories: List[str]
 
 
@@ -100,10 +89,11 @@ class GenerateMusicResponse(BaseModel):
 
 @app.cls(
     image=image,
-    gpu="A100-80GB",  # 1B DiT × 32 euler steps × CFG needs ~44 GB peak; L40S (48 GB) OOMs
+    gpu="A100-80GB",
     volumes={"/.cache/huggingface": hf_volume},
     secrets=[music_gen_secrets],
     scaledown_window=15,
+    timeout=900,  # 15 min — diffusion (2 min) + CPU/GPU transfers + upload
 )
 class MusicGenServer:
 
@@ -113,24 +103,32 @@ class MusicGenServer:
         from groq import Groq
         from diffusers import StableDiffusionXLPipeline
 
-        # All DiffRhythm code uses relative paths — anchor to the repo root.
         os.chdir("/tmp/DiffRhythm")
-        from infer_utils import prepare_model
 
         self.device = "cuda"
-
-        # Groq client for text generation (lyrics, prompts, categories)
         self.groq = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-        # DiffRhythm base model — max_frames=2048 (95 s output)
+        # CRITICAL: patch out torch.compile BEFORE importing prepare_model.
+        # prepare_model calls torch.compile(cfm) internally, creating a persistent
+        # CUDA graph that holds ~78 GB outside PyTorch's normal allocator.
+        # This memory is invisible to memory_allocated() and impossible to free
+        # with empty_cache() — causing VAE decode to OOM even though the CFM
+        # parameters have been moved to CPU.
+        torch.compile = lambda model, *args, **kwargs: model
+
+        from infer_utils import prepare_model
+
         (
             self.cfm,
             self.tokenizer_dr,
             self.muq,
             self.vae,
-        ) = prepare_model(max_frames=2048, device=self.device)
+        ) = prepare_model(max_frames=2048, device="cpu")
 
-        # SDXL-Turbo — cover art (stays on CPU until needed)
+        # MuQ and VAE park on GPU between requests; CFM stays on CPU
+        self.muq = self.muq.to(self.device)
+        self.vae = self.vae.to(self.device)
+
         self.image_pipe = StableDiffusionXLPipeline.from_pretrained(
             "stabilityai/sdxl-turbo",
             torch_dtype=torch.float16,
@@ -140,7 +138,7 @@ class MusicGenServer:
         self.image_pipe.to("cpu")
 
     # ------------------------------------------------------------------
-    # LLM helpers — Groq API (no GPU memory needed)
+    # LLM helpers
     # ------------------------------------------------------------------
 
     def _ask_llm(self, prompt: str) -> str:
@@ -153,14 +151,10 @@ class MusicGenServer:
         return resp.choices[0].message.content.strip()
 
     def generate_prompt(self, description: str) -> str:
-        return self._ask_llm(
-            PROMPT_GENERATOR_PROMPT.format(user_prompt=description)
-        )
+        return self._ask_llm(PROMPT_GENERATOR_PROMPT.format(user_prompt=description))
 
     def generate_lyrics(self, description: str) -> str:
-        return self._ask_llm(
-            LYRICS_GENERATOR_PROMPT.format(description=description)
-        )
+        return self._ask_llm(LYRICS_GENERATOR_PROMPT.format(description=description))
 
     def generate_categories(self, description: str) -> List[str]:
         prompt = (
@@ -172,7 +166,7 @@ class MusicGenServer:
         return [c.strip() for c in raw.split(",") if c.strip()]
 
     # ------------------------------------------------------------------
-    # Core DiffRhythm generation + S3 upload
+    # Core generation
     # ------------------------------------------------------------------
 
     def _generate_and_upload(
@@ -188,6 +182,7 @@ class MusicGenServer:
         description_for_categorization: str,
     ) -> GenerateMusicResponse:
         import torch
+        import gc
         import torchaudio
         from einops import rearrange
         from supabase import create_client
@@ -202,11 +197,17 @@ class MusicGenServer:
         output_dir = "/tmp/outputs"
         os.makedirs(output_dir, exist_ok=True)
 
-        # Park VAE on CPU during diffusion — it is only needed for final decode
-        self.vae.to("cpu")
-        torch.cuda.empty_cache()
+        def _gpu_mb():
+            return torch.cuda.memory_allocated() / 1024**2
 
-        # Build LRC or leave empty for instrumental
+        def _flush():
+            """Force PyTorch to actually release CUDA memory."""
+            gc.collect()
+            torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # --- Build LRC ---
         if instrumental:
             lrc_content = ""
         else:
@@ -215,113 +216,111 @@ class MusicGenServer:
         print(f"Style prompt : {style_prompt}")
         print(f"LRC content  :\n{lrc_content}")
 
-        # Base model supports max 95 s (max_frames=2048)
         max_frames = 2048
         audio_duration = min(audio_duration, 95.0)
         sample_rate = 44100
 
-        # --- Tokenise inputs (fixed signatures) ---
+        # --- Tokenize + style embed (MuQ is on GPU) ---
         lrc_prompt, lrc_start_time, end_frame, song_duration = get_lrc_token(
             max_frames, lrc_content, self.tokenizer_dr, audio_duration, self.device
         )
-        # get_style_prompt requires the muq model as the first argument
         style_prompt_token = get_style_prompt(self.muq, prompt=style_prompt)
         negative_style_prompt = get_negative_style_prompt(self.device)
 
-        # Unconditional reference latent (no audio reference / no edit mode)
         ref_latent, pred_frames = get_reference_latent(
             self.device, max_frames, False, None, None, None
         )
 
-        def _gpu_mb():
-            return torch.cuda.memory_allocated() / 1024**2
-
-        # --- Offload MuQ (no longer needed) to CPU to free VRAM ---
+        # Move MuQ + VAE off GPU to make room for CFM
         self.muq.to("cpu")
-        torch.cuda.empty_cache()
-        print(f"[mem] after MuQ→CPU: {_gpu_mb():.0f} MB")
+        self.vae.to("cpu")
+        _flush()
+        print(f"[mem] after MuQ+VAE→CPU: {_gpu_mb():.0f} MB")
 
-        # --- DiffRhythm diffusion with MANUAL euler loop ---
-        # We bypass cfm.sample() / torchdiffeq.odeint entirely because odeint
-        # accumulates ~40 GB of intermediate tensors that resist cleanup.
-        # A manual euler loop keeps only ONE step in memory at a time.
+        # --- Move CFM to GPU for diffusion ---
+        self.cfm.to(self.device)
+        print(f"[mem] after CFM→GPU: {_gpu_mb():.0f} MB")
 
         from model.cfm import custom_mask_from_start_end_indices
 
         cfm = self.cfm
         cfm.eval()
 
-        # Half precision if the model is in fp16
         if next(cfm.parameters()).dtype == torch.float16:
             ref_latent = ref_latent.half()
 
         if ref_latent.shape[1] > end_frame:
             ref_latent = ref_latent[:, :end_frame, :]
 
-        # Prediction mask (same logic as cfm.sample)
         pred_segments_t = torch.tensor(pred_frames).to(self.device)
         fixed_span_mask = custom_mask_from_start_end_indices(
             end_frame, pred_segments_t, device=self.device, max_seq_len=end_frame
         ).unsqueeze(-1)
         step_cond = torch.where(fixed_span_mask, torch.zeros_like(ref_latent), ref_latent)
 
-        # Initial noise
         torch.manual_seed(seed)
         y = torch.randn(1, end_frame, cfm.num_channels,
-                         device=self.device, dtype=step_cond.dtype)
-
-        # Euler time grid
+                        device=self.device, dtype=step_cond.dtype)
         t_steps = torch.linspace(0, 1, steps, device=self.device, dtype=step_cond.dtype)
 
         with torch.inference_mode():
             for i in range(len(t_steps) - 1):
                 t_val = t_steps[i]
                 dt = t_steps[i + 1] - t_steps[i]
-
-                # Conditional prediction
                 pred = cfm.transformer(
                     x=y, cond=step_cond, text=lrc_prompt, time=t_val,
                     drop_audio_cond=False, drop_text=False, drop_prompt=False,
                     style_prompt=style_prompt_token, start_time=lrc_start_time,
                     duration=song_duration,
                 )
-                # Unconditional prediction (for classifier-free guidance)
                 null_pred = cfm.transformer(
                     x=y, cond=step_cond, text=lrc_prompt, time=t_val,
                     drop_audio_cond=True, drop_text=True, drop_prompt=False,
                     style_prompt=negative_style_prompt, start_time=lrc_start_time,
                     duration=song_duration,
                 )
-
-                # CFG combination + euler step
                 velocity = pred + (pred - null_pred) * cfg_strength
                 del pred, null_pred
                 y = y + dt * velocity
                 del velocity
 
-        # Apply conditioning mask
         sampled = torch.where(fixed_span_mask, y, ref_latent)
-
-        # Save result to CPU, free everything on GPU
         latent_result = sampled.to(torch.float32).clone().cpu()
+
+        # Free all diffusion tensors from GPU
         del sampled, y, fixed_span_mask, step_cond, pred_segments_t
         del ref_latent, lrc_prompt, style_prompt_token
         del negative_style_prompt, lrc_start_time, song_duration
+        del cfm  # drop local alias
+        _flush()
 
-        # --- Offload CFM to CPU before VAE decode ---
+        # Nuclear CUDA memory release sequence:
+        # Step 1: move CFM parameters to CPU and zero gradients
         self.cfm.to("cpu")
-        import gc; gc.collect()
-        torch.cuda.empty_cache()
-        print(f"[mem] after CFM→CPU + cache clear: {_gpu_mb():.0f} MB")
+        for p in self.cfm.parameters():
+            p.grad = None
+        # Step 2: sync CUDA stream so all ops are complete
+        torch.cuda.synchronize()
+        # Step 3: double flush — empty_cache twice forces the allocator
+        #          to return blocks to the driver
+        _flush()
+        _flush()
+        print(f"[mem] after CFM→CPU + sync: {_gpu_mb():.0f} MB")
 
-        # Bring VAE back to GPU for decode
+        # --- VAE decode on GPU ---
+        # synchronize() above ensures all euler loop activations are freed.
+        # GPU only has 8 MB allocated now, so VAE (604 MB) fits easily.
+        print(f"[mem] before VAE→GPU: {_gpu_mb():.0f} MB")
+
         self.vae.to(self.device)
+        _flush()
         print(f"[mem] after VAE→GPU: {_gpu_mb():.0f} MB")
 
-        # Decode the latent → stereo int16 waveform
-        latent = latent_result.to(self.device).transpose(1, 2)  # [b, d, t]
+        latent = latent_result.to(self.device).float().transpose(1, 2)  # [b, d, t]
         del latent_result
-        audio = decode_audio(latent, self.vae, chunked=True)  # always chunked to save VRAM
+        _flush()
+
+        audio = decode_audio(latent, self.vae, chunked=True, chunk_size=64, overlap=16)
         del latent
         audio = rearrange(audio, "b d n -> d (b n)")
         generated_song = (
@@ -332,13 +331,14 @@ class MusicGenServer:
             .to(torch.int16)
             .cpu()
         )
+        del audio
+        _flush()
 
-        # Save WAV
+        # --- Upload audio ---
         audio_filename = f"{uuid.uuid4()}.wav"
         output_path = os.path.join(output_dir, audio_filename)
         torchaudio.save(output_path, generated_song, sample_rate=sample_rate)
 
-        # --- Upload to Supabase Storage ---
         supabase = create_client(
             os.environ["SUPABASE_URL"],
             os.environ["SUPABASE_KEY"],
@@ -353,11 +353,8 @@ class MusicGenServer:
         os.remove(output_path)
         audio_url = supabase.storage.from_(bucket).get_public_url(audio_filename)
 
-        # Free VAE + diffusion VRAM before thumbnail generation
-        self.vae.to("cpu")
-        torch.cuda.empty_cache()
-
-        # Thumbnail via SDXL-Turbo (move to GPU, generate, move back)
+        # --- Cover art via SDXL-Turbo ---
+        # VAE is already on CPU; image_pipe needs GPU
         self.image_pipe.to(self.device)
         thumb_prompt = f"{style_prompt}, album cover art"
         img = self.image_pipe(
@@ -378,10 +375,9 @@ class MusicGenServer:
         os.remove(image_path)
         cover_image_url = supabase.storage.from_(bucket).get_public_url(image_filename)
 
-        # Move SDXL back to CPU and restore DiffRhythm models for next request
+        # Restore idle state: MuQ + VAE on GPU, CFM + image_pipe on CPU
         self.image_pipe.to("cpu")
-        torch.cuda.empty_cache()
-        self.cfm.to(self.device)
+        _flush()
         self.muq.to(self.device)
         self.vae.to(self.device)
 
@@ -394,16 +390,12 @@ class MusicGenServer:
         )
 
     # ------------------------------------------------------------------
-    # Internal Modal method — callable with .remote() from local_entrypoint
-    # or any other Modal function. The HTTP webhooks below delegate here too.
+    # Endpoints
     # ------------------------------------------------------------------
 
     @modal.method()
     def run(self, request: GenerateWithDescribedLyricsRequest) -> GenerateMusicResponse:
-        """Run generation remotely. Used by local_entrypoint for smoke-tests."""
-        lyrics = "" if request.instrumental else self.generate_lyrics(
-            request.described_lyrics
-        )
+        lyrics = "" if request.instrumental else self.generate_lyrics(request.described_lyrics)
         return self._generate_and_upload(
             style_prompt=request.prompt,
             lyrics=lyrics,
@@ -411,20 +403,12 @@ class MusicGenServer:
             **request.model_dump(exclude={"prompt", "described_lyrics"}),
         )
 
-    # ------------------------------------------------------------------
-    # HTTP Endpoints  (external callers — frontend, API clients)
-    # ------------------------------------------------------------------
-
-    @modal.fastapi_endpoint(method="POST", requires_proxy_auth=True)
+    @modal.fastapi_endpoint(method="POST")
     def generate_from_description(
         self, request: GenerateFromDescriptionRequest
     ) -> GenerateMusicResponse:
-        """Generate a full song from a free-form description (prompt + lyrics
-        are both LLM-generated)."""
         style_prompt = self.generate_prompt(request.full_described_song)
-        lyrics = "" if request.instrumental else self.generate_lyrics(
-            request.full_described_song
-        )
+        lyrics = "" if request.instrumental else self.generate_lyrics(request.full_described_song)
         return self._generate_and_upload(
             style_prompt=style_prompt,
             lyrics=lyrics,
@@ -432,11 +416,10 @@ class MusicGenServer:
             **request.model_dump(exclude={"full_described_song"}),
         )
 
-    @modal.fastapi_endpoint(method="POST", requires_proxy_auth=True)
+    @modal.fastapi_endpoint(method="POST")
     def generate_with_lyrics(
         self, request: GenerateWithCustomLyricsRequest
     ) -> GenerateMusicResponse:
-        """Generate with a user-supplied style prompt and plain lyrics."""
         return self._generate_and_upload(
             style_prompt=request.prompt,
             lyrics=request.lyrics,
@@ -444,15 +427,11 @@ class MusicGenServer:
             **request.model_dump(exclude={"prompt", "lyrics"}),
         )
 
-    @modal.fastapi_endpoint(method="POST", requires_proxy_auth=True)
+    @modal.fastapi_endpoint(method="POST")
     def generate_with_described_lyrics(
         self, request: GenerateWithDescribedLyricsRequest
     ) -> GenerateMusicResponse:
-        """Generate with a user-supplied style prompt; lyrics are LLM-generated
-        from a description."""
-        lyrics = "" if request.instrumental else self.generate_lyrics(
-            request.described_lyrics
-        )
+        lyrics = "" if request.instrumental else self.generate_lyrics(request.described_lyrics)
         return self._generate_and_upload(
             style_prompt=request.prompt,
             lyrics=lyrics,
@@ -462,16 +441,12 @@ class MusicGenServer:
 
 
 # ---------------------------------------------------------------------------
-# Local entrypoint for quick smoke-test
+# Local entrypoint
 # ---------------------------------------------------------------------------
 
 @app.local_entrypoint()
 def main():
-    # `@modal.fastapi_endpoint` functions are webhooks — they cannot be called
-    # with .remote(). Use the dedicated @modal.method `run` instead, which
-    # executes on the GPU container and returns the result directly.
     server = MusicGenServer()
-
     request_data = GenerateWithDescribedLyricsRequest(
         prompt="rave, funk, 140BPM, disco",
         described_lyrics="lyrics about water bottles",
@@ -479,9 +454,7 @@ def main():
         steps=32,
         audio_duration=95.0,
     )
-
     result = server.run.remote(request_data)
-
     print(f"Audio  : {result.audio_url}")
     print(f"Cover  : {result.cover_image_url}")
     print(f"Tags   : {result.categories}")
